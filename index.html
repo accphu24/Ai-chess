@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chess AI Arena</title>
+<style>
+  :root { --bg:#f6f5f2; --fg:#222; --card:#fff; --muted:#666; --bd:#ddd; --accent:#2b6cb0; --light:#f0d9b5; --dark:#b58863; --hl:#f7ec74; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#1b1b1b; --fg:#eee; --card:#262626; --muted:#aaa; --bd:#3a3a3a; --accent:#63a4ff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
+  h1 { font-size:20px; margin:0 0 12px; }
+  .wrap { display:flex; flex-wrap:wrap; gap:16px; max-width:980px; margin:0 auto; }
+  .card { background:var(--card); border:1px solid var(--bd); border-radius:10px; padding:12px; }
+  .left { flex:0 0 auto; width:min(94vw, 480px); }
+  .right { flex:1 1 300px; min-width:280px; display:flex; flex-direction:column; gap:12px; }
+  #board { display:grid; grid-template-columns:repeat(8,1fr); width:100%; aspect-ratio:1; border:2px solid var(--dark); }
+  .sq { display:flex; align-items:center; justify-content:center; font-size:clamp(24px, 7.5vw, 44px); line-height:1; }
+  .sq.l { background:var(--light); } .sq.d { background:var(--dark); } .sq.h { background:var(--hl); }
+  .w { color:#fff; text-shadow:0 0 2px #000,0 0 2px #000,0 0 2px #000,0 0 1px #000; }
+  .b { color:#111; }
+  #status { font-weight:600; margin-top:10px; min-height:1.4em; }
+  .players { color:var(--muted); font-size:13px; }
+  label { display:block; font-size:13px; color:var(--muted); margin-bottom:2px; }
+  input { width:100%; padding:7px 8px; border:1px solid var(--bd); border-radius:6px; background:var(--bg); color:var(--fg); font:inherit; }
+  .row { display:flex; gap:8px; } .row > div { flex:1; }
+  .btns { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+  button { padding:8px 12px; border:1px solid var(--bd); border-radius:6px; background:var(--card); color:var(--fg); font:inherit; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  #log { max-height:340px; overflow:auto; font-size:14px; }
+  .mv { font-weight:600; margin-top:6px; } .note { color:var(--muted); font-size:13px; white-space:pre-wrap; }
+  .hint { font-size:12px; color:var(--muted); margin-top:6px; }
+  #err { color:#c53030; font-size:13px; margin-top:6px; min-height:1em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="left card">
+    <h1>Chess AI Arena</h1>
+    <div id="board"></div>
+    <div id="status">Đang tải...</div>
+    <div class="players" id="players"></div>
+  </div>
+
+  <div class="right">
+    <div class="card">
+      <div class="row">
+        <div><label>Trắng</label><input id="white" list="presets" value="random"></div>
+        <div><label>Đen</label><input id="black" list="presets" value="random"></div>
+      </div>
+      <datalist id="presets">
+        <option value="random">
+        <option value="stockfish">
+        <option value="claude:claude-sonnet-5-5">
+        <option value="claude:claude-haiku-5-5">
+        <option value="claude:claude-opus-5-5">
+        <option value="gemini:">
+        <option value="groq:">
+        <option value="openrouter:">
+        <option value="ollama:">
+      </datalist>
+      <div class="row" style="margin-top:8px">
+        <div><label>Nghỉ giữa các nước (giây)</label><input id="delay" type="number" min="0" max="30" step="0.5" value="1"></div>
+        <div><label>Giới hạn nửa-nước</label><input id="maxplies" type="number" min="10" max="400" value="200"></div>
+      </div>
+      <div class="btns">
+        <button class="primary" id="start">Bắt đầu ván mới</button>
+        <button id="pause" disabled>Tạm dừng</button>
+        <button id="stop" disabled>Dừng</button>
+        <button id="pgn" disabled>Tải PGN</button>
+      </div>
+      <div class="hint">Gõ <b>loại:tên-model</b>, ví dụ <code>gemini:tên-model</code>. Chọn <code>random</code> để thử miễn phí.</div>
+      <div id="err"></div>
+    </div>
+    <div class="card"><div id="log"></div></div>
+  </div>
+</div>
+
+<script>
+const GLYPH = { K:'♚', Q:'♛', R:'♜', B:'♝', N:'♞', P:'♟\uFE0E' };
+let token = localStorage.getItem('token') || '';
+const $ = id => document.getElementById(id);
+
+async function api(path, opt = {}) {
+  opt.headers = Object.assign({ 'Content-Type': 'application/json', 'X-Token': token }, opt.headers || {});
+  const r = await fetch(path, opt);
+  if (r.status === 401) {
+    const t = prompt('Nhập mã truy cập (ACCESS_TOKEN):');
+    if (!t) throw new Error('Cần mã truy cập');
+    token = t; localStorage.setItem('token', t);
+    return api(path, opt);
+  }
+  return r;
+}
+
+function renderBoard(fen, last) {
+  const board = $('board');
+  board.innerHTML = '';
+  const hl = last ? [last.slice(0, 2), last.slice(2, 4)] : [];
+  const rows = fen.split(' ')[0].split('/');
+  function cell(r, f, p) {
+    const sq = 'abcdefgh'[f] + (8 - r);
+    const d = document.createElement('div');
+    d.className = 'sq ' + (((r + f) % 2) ? 'd' : 'l') + (hl.includes(sq) ? ' h' : '');
+    if (p) {
+      const s = document.createElement('span');
+      s.className = (p === p.toUpperCase()) ? 'w' : 'b';
+      s.textContent = GLYPH[p.toUpperCase()];
+      d.appendChild(s);
+    }
+    board.appendChild(d);
+  }
+  rows.forEach((row, r) => {
+    let f = 0;
+    for (const ch of row) {
+      if (/\d/.test(ch)) { for (let i = 0; i < +ch; i++) cell(r, f++, ''); }
+      else cell(r, f++, ch);
+    }
+  });
+}
+
+function renderLog(log) {
+  const el = $('log');
+  const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+  el.innerHTML = '';
+  for (const m of log) {
+    const a = document.createElement('div');
+    a.className = 'mv';
+    a.textContent = `${m.n}${m.white ? '. ' : '... '}${m.san}  (${m.who})`;
+    el.appendChild(a);
+    if (m.note) {
+      const n = document.createElement('div');
+      n.className = 'note';
+      n.textContent = m.note;
+      el.appendChild(n);
+    }
+  }
+  if (stick) el.scrollTop = el.scrollHeight;
+}
+
+function statusText(s) {
+  const side = s.thinking === 'white' ? 'Trắng' : 'Đen';
+  if (s.status === 'idle') return 'Chưa có ván nào. Chọn người chơi rồi bấm "Bắt đầu".';
+  if (s.status === 'error') return 'Lỗi: ' + s.message;
+  if (s.status === 'stopped') return 'Đã dừng ván.';
+  if (s.status === 'finished') return `Kết thúc: ${s.result} (${s.message})`;
+  if (s.paused) return 'Đã tạm dừng';
+  if (s.thinking) return `${side} đang suy nghĩ...`;
+  return 'Đang chơi...';
+}
+
+async function refresh() {
+  try {
+    const s = await (await api('/api/state')).json();
+    renderBoard(s.fen, s.last);
+    renderLog(s.log);
+    $('status').textContent = statusText(s);
+    $('players').textContent = s.white ? `Trắng: ${s.white}  ·  Đen: ${s.black}` : '';
+    const running = s.status === 'running';
+    $('start').disabled = running;
+    $('pause').disabled = !running;
+    $('pause').textContent = s.paused ? 'Tiếp tục' : 'Tạm dừng';
+    $('stop').disabled = !running;
+    $('pgn').disabled = s.status === 'idle';
+  } catch (e) { $('status').textContent = e.message; }
+}
+
+async function call(path, body) {
+  $('err').textContent = '';
+  const r = await api(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined });
+  if (!r.ok) {
+    let msg = r.statusText;
+    try { msg = (await r.json()).detail || msg; } catch (_) {}
+    $('err').textContent = msg;
+  }
+  refresh();
+}
+
+$('start').onclick = () => call('/api/start', {
+  white: $('white').value, black: $('black').value,
+  delay: parseFloat($('delay').value) || 0, max_plies: parseInt($('maxplies').value) || 200,
+});
+$('pause').onclick = () => call('/api/pause');
+$('stop').onclick = () => call('/api/stop');
+$('pgn').onclick = async () => {
+  const r = await api('/api/pgn');
+  if (!r.ok) return;
+  const url = URL.createObjectURL(new Blob([await r.text()], { type: 'text/plain' }));
+  const a = document.createElement('a');
+  a.href = url; a.download = 'game.pgn'; a.click();
+  URL.revokeObjectURL(url);
+};
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
