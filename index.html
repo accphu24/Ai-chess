@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>Chess AI Arena</title>
 <style>
   :root { --bg:#f6f5f2; --fg:#222; --card:#fff; --muted:#666; --bd:#ddd; --accent:#2b6cb0; --light:#f0d9b5; --dark:#b58863; --hl:#f7ec74; }
@@ -19,8 +20,9 @@
   #board { display:grid; grid-template-columns:repeat(8,1fr); width:100%; aspect-ratio:1; border:2px solid var(--dark); }
   .sq { display:flex; align-items:center; justify-content:center; font-size:clamp(24px, 7.5vw, 44px); line-height:1; }
   .sq.l { background:var(--light); } .sq.d { background:var(--dark); } .sq.h { background:var(--hl); }
-  .w { color:#fff; text-shadow:0 0 2px #000,0 0 2px #000,0 0 2px #000,0 0 1px #000; }
-  .b { color:#111; }
+  .sq span { forced-color-adjust:none; }
+  .w { color:#fff; -webkit-text-fill-color:#fff; text-shadow:0 0 2px #000,0 0 2px #000,0 0 2px #000,0 0 1px #000; }
+  .b { color:#000; -webkit-text-fill-color:#000; text-shadow:0 0 1px rgba(255,255,255,.55); }
   #status { font-weight:600; margin-top:10px; min-height:1.4em; }
   .players { color:var(--muted); font-size:13px; }
   label { display:block; font-size:13px; color:var(--muted); margin-bottom:2px; }
@@ -86,6 +88,7 @@ const $ = id => document.getElementById(id);
 
 async function api(path, opt = {}) {
   opt.headers = Object.assign({ 'Content-Type': 'application/json', 'X-Token': token }, opt.headers || {});
+  opt.cache = 'no-store';
   const r = await fetch(path, opt);
   if (r.status === 401) {
     const t = prompt('Nhập mã truy cập (ACCESS_TOKEN):');
@@ -194,8 +197,9 @@ $('pgn').onclick = async () => {
   URL.revokeObjectURL(url);
 };
 
-refresh();
-setInterval(refresh, 1000);
+async function loop() { await refresh(); setTimeout(loop, 1000); }
+loop();
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
 </script>
 </body>
 </html>
