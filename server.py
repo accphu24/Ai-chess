@@ -3,7 +3,7 @@ Chess AI Arena - bản web (FastAPI). Chạy một ván tại một thời đi�
 
 Chạy local:
     pip install -r requirements.txt
-    export ANTHROPIC_API_KEY=...        # chỉ cần key của dịch vụ bạn định dùng
+    export GEMINI_API_KEY=...           # chỉ cần key của dịch vụ bạn định dùng
     uvicorn server:app --port 8080      # rồi mở http://localhost:8080
 
 Khi đưa lên mạng, đặt ACCESS_TOKEN để chỉ mình bạn dùng được (tránh người lạ
@@ -22,7 +22,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from players import make_player
+from players import PRESETS, make_player
 
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -36,19 +36,24 @@ def auth(x_token: str = Header(default="")):
 
 
 class Game:
-    def __init__(self, white, black, white_spec, black_spec, delay, max_plies):
+    """phase: idle (giữa 2 nước) | thinking (AI đang nghĩ) | ready (AI đã nghĩ xong, chờ bấm Tiếp tục)
+    | error (AI gặp lỗi, chờ bấm Tiếp tục để thử lại)."""
+
+    def __init__(self, white, black, delay, max_plies, manual):
         self.players = {chess.WHITE: white, chess.BLACK: black}
-        self.specs = {chess.WHITE: white_spec, chess.BLACK: black_spec}
         self.delay = delay
         self.max_plies = max_plies
+        self.manual = manual
         self.board = chess.Board()
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
-        self.paused = False
+        self.go = threading.Event()  # được set khi người dùng bấm "Tiếp tục"
+        self.paused = False  # chỉ dùng ở chế độ tự chạy
+        self.phase = "idle"
+        self.error = ""
         self.status = "running"  # running | finished | stopped | error
         self.message = ""
         self.result = "*"
-        self.thinking = None  # chess.WHITE / chess.BLACK / None
         self.last = None
         self.log = []
         self.thread = threading.Thread(target=self.run, daemon=True)
@@ -59,16 +64,21 @@ class Game:
 
     def snapshot(self):
         with self.lock:
+            running = self.status == "running"
             return {
                 "status": self.status,
                 "paused": self.paused,
+                "manual": self.manual,
+                "phase": self.phase,
+                "error": self.error,
+                "can_continue": running and (self.phase in ("ready", "error") or self.paused),
+                "turn": "white" if self.board.turn == chess.WHITE else "black",
                 "message": self.message,
                 "result": self.result,
                 "fen": self.board.fen(),
                 "last": self.last,
                 "white": self.players[chess.WHITE].name,
                 "black": self.players[chess.BLACK].name,
-                "thinking": None if self.thinking is None else ("white" if self.thinking else "black"),
                 "log": list(self.log),
             }
 
@@ -88,18 +98,36 @@ class Game:
         while time.time() < end and not self.stop_event.is_set():
             time.sleep(0.1)
 
-    def _fail(self, msg):
-        with self.lock:
-            self.status = "error"
-            self.message = msg
-            self.thinking = None
+    def _wait_go(self, release_when_auto):
+        """Chờ người dùng bấm Tiếp tục (hoặc dừng ván). Nếu bật lại chế độ tự chạy thì đi luôn."""
+        while not self.stop_event.is_set():
+            if self.go.wait(0.2):
+                return
+            if release_when_auto and not self.manual:
+                return
+
+    def _think(self, player):
+        """Hỏi AI nước đi. Nếu lỗi thì chờ người dùng bấm Tiếp tục để thử lại."""
+        while not self.stop_event.is_set():
+            with self.lock:
+                self.phase = "thinking"
+                self.error = ""
+                board_copy = self.board.copy()
+            try:
+                return player.choose_move(board_copy)
+            except Exception as e:  # lỗi mạng, hết quota, lỗi phía dịch vụ...
+                with self.lock:
+                    self.go.clear()
+                    self.phase = "error"
+                    self.error = f"{player.name}: {e}"
+                self._wait_go(release_when_auto=False)
+        return None, None
 
     def run(self):
         try:
             while not self.stop_event.is_set():
                 with self.lock:
                     over = self.board.is_game_over(claim_draw=True) or len(self.board.move_stack) >= self.max_plies
-                    paused = self.paused
                 if over:
                     with self.lock:
                         outcome = self.board.outcome(claim_draw=True)
@@ -110,29 +138,33 @@ class Game:
                             self.result = "*"
                             self.message = "ĐẠT GIỚI HẠN SỐ NƯỚC"
                         self.status = "finished"
-                        self.thinking = None
+                        self.phase = "idle"
                     return
-                if paused:
+                while self.paused and not self.stop_event.is_set():
                     time.sleep(0.2)
-                    continue
+                if self.stop_event.is_set():
+                    return
 
                 with self.lock:
                     turn = self.board.turn
-                    board_copy = self.board.copy()
-                    self.thinking = turn
                 player = self.players[turn]
-                try:
-                    move, note = player.choose_move(board_copy)
-                except Exception as e:  # lỗi mạng, hết quota, key sai...
-                    self._fail(f"{player.name}: {e}")
+                move, note = self._think(player)
+                if move is None or self.stop_event.is_set():
                     return
-                if self.stop_event.is_set():
-                    return
+
+                if self.manual:  # AI đã nghĩ xong → chờ người dùng bấm Tiếp tục
+                    with self.lock:
+                        self.go.clear()
+                        self.phase = "ready"
+                    self._wait_go(release_when_auto=True)
+                    if self.stop_event.is_set():
+                        return
+
                 with self.lock:
                     if move not in self.board.legal_moves:
                         self.status = "error"
                         self.message = f"{player.name} trả về nước không hợp lệ"
-                        self.thinking = None
+                        self.phase = "idle"
                         return
                     number = self.board.fullmove_number
                     san = self.board.san(move)
@@ -140,8 +172,9 @@ class Game:
                                      "who": player.name, "note": note or ""})
                     self.board.push(move)
                     self.last = move.uci()
-                    self.thinking = None
-                self._sleep(self.delay)
+                    self.phase = "idle"
+                if not self.manual:
+                    self._sleep(self.delay)
         finally:
             for p in self.players.values():
                 p.close()
@@ -156,6 +189,11 @@ class StartReq(BaseModel):
     black: str = "random"
     delay: float = 1.0
     max_plies: int = 200
+    manual: bool = True
+
+
+class ModeReq(BaseModel):
+    manual: bool
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -170,6 +208,7 @@ def healthz():
     return "ok"
 
 
+# ---- danh sách model cho menu chọn ----
 _models_cache = {"t": 0.0, "data": None}
 _EXCLUDE = ("whisper", "tts", "guard", "embed", "imagen", "veo", "image", "aqa", "audio",
             "orpheus", "playai", "moderation", "transcribe", "live", "robotics")
@@ -178,7 +217,6 @@ PROVIDER_LABELS = {"gemini": "Gemini", "groq": "Groq", "openrouter": "OpenRouter
 
 def _list_models(provider):
     from openai import OpenAI
-    from players import PRESETS
 
     base_url, key_env = PRESETS[provider]
     api_key = os.environ.get(key_env, "") if key_env else "ollama"
@@ -211,7 +249,6 @@ def models(refresh: bool = False):
         ]})
     else:
         notes.append("Chưa đặt ANTHROPIC_API_KEY")
-    from players import PRESETS
     for provider in ("gemini", "groq", "openrouter", "ollama"):
         key_env = PRESETS[provider][1]
         if key_env and not os.environ.get(key_env):
@@ -233,12 +270,13 @@ def models(refresh: bool = False):
     return data
 
 
+# ---- điều khiển ván cờ ----
 @app.get("/api/state", dependencies=[Depends(auth)])
 def state():
     if current is None:
-        return {"status": "idle", "paused": False, "message": "", "result": "*",
-                "fen": chess.STARTING_FEN, "last": None, "white": "", "black": "",
-                "thinking": None, "log": []}
+        return {"status": "idle", "paused": False, "manual": True, "phase": "idle", "error": "",
+                "can_continue": False, "turn": "white", "message": "", "result": "*",
+                "fen": chess.STARTING_FEN, "last": None, "white": "", "black": "", "log": []}
     return current.snapshot()
 
 
@@ -259,8 +297,24 @@ def start(req: StartReq):
             raise HTTPException(400, f"Không tạo được người chơi Đen: {e}")
         delay = max(0.0, min(30.0, req.delay))
         max_plies = max(10, min(400, req.max_plies))
-        current = Game(white, black, req.white, req.black, delay, max_plies)
+        current = Game(white, black, delay, max_plies, req.manual)
         current.thread.start()
+    return {"ok": True}
+
+
+@app.post("/api/continue", dependencies=[Depends(auth)])
+def continue_game():
+    """Chế độ từng nước: thực hiện nước AI đã nghĩ (hoặc thử lại nếu AI gặp lỗi).
+    Chế độ tự chạy: chạy tiếp sau khi tạm dừng."""
+    if current is None or not current.active():
+        raise HTTPException(409, "Không có ván nào đang chạy.")
+    with current.lock:
+        if current.phase in ("ready", "error"):
+            current.go.set()
+        elif current.paused:
+            current.paused = False
+        else:
+            raise HTTPException(409, "AI chưa nghĩ xong, chưa có gì để tiếp tục.")
     return {"ok": True}
 
 
@@ -269,8 +323,20 @@ def pause():
     if current is None or not current.active():
         raise HTTPException(409, "Không có ván nào đang chạy.")
     with current.lock:
-        current.paused = not current.paused
-        return {"paused": current.paused}
+        if current.manual:
+            raise HTTPException(409, "Ở chế độ từng nước, ván tự chờ sau mỗi nước.")
+        current.paused = True
+    return {"paused": True}
+
+
+@app.post("/api/mode", dependencies=[Depends(auth)])
+def mode(req: ModeReq):
+    if current is not None and current.active():
+        with current.lock:
+            current.manual = req.manual
+            if req.manual:
+                current.paused = False
+    return {"manual": req.manual}
 
 
 @app.post("/api/stop", dependencies=[Depends(auth)])
@@ -280,7 +346,7 @@ def stop():
     current.stop_event.set()
     with current.lock:
         current.status = "stopped"
-        current.thinking = None
+        current.phase = "idle"
     return {"ok": True}
 
 
