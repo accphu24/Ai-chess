@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: chess-ai-arena
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /healthz
+    envVars:
+      - key: ACCESS_TOKEN      # mật khẩu để chỉ mình bạn dùng được
+        sync: false
+      - key: GEMINI_API_KEY    # chỉ điền key của dịch vụ bạn dùng, key còn lại để trống
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false

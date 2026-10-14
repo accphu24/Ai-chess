@@ -164,6 +164,12 @@ def index():
         return f.read()
 
 
+@app.get("/healthz", response_class=PlainTextResponse)
+def healthz():
+    """Không cần mã truy cập: dành cho health check của Render và UptimeRobot."""
+    return "ok"
+
+
 @app.get("/api/state", dependencies=[Depends(auth)])
 def state():
     if current is None:
