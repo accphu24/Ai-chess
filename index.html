@@ -17,8 +17,8 @@
   .card { background:var(--card); border:1px solid var(--bd); border-radius:10px; padding:12px; }
   .left { flex:0 0 auto; width:min(94vw, 480px); }
   .right { flex:1 1 300px; min-width:280px; display:flex; flex-direction:column; gap:12px; }
-  #board { display:grid; grid-template-columns:repeat(8,1fr); width:100%; aspect-ratio:1; border:2px solid var(--dark); }
-  .sq { display:flex; align-items:center; justify-content:center; font-size:clamp(24px, 7.5vw, 44px); line-height:1; }
+  #board { display:grid; grid-template-columns:repeat(8,minmax(0,1fr)); grid-template-rows:repeat(8,minmax(0,1fr)); width:100%; aspect-ratio:1; border:2px solid var(--dark); container-type:inline-size; overflow:hidden; }
+  .sq { display:flex; align-items:center; justify-content:center; font-size:clamp(20px, 7vw, 44px); font-size:9.5cqw; line-height:1; min-width:0; min-height:0; overflow:hidden; }
   .sq.l { background:var(--light); } .sq.d { background:var(--dark); } .sq.h { background:var(--hl); }
   .sq span { forced-color-adjust:none; }
   .w { color:#fff; -webkit-text-fill-color:#fff; text-shadow:0 0 2px #000,0 0 2px #000,0 0 2px #000,0 0 1px #000; }
@@ -26,7 +26,7 @@
   #status { font-weight:600; margin-top:10px; min-height:1.4em; }
   .players { color:var(--muted); font-size:13px; }
   label { display:block; font-size:13px; color:var(--muted); margin-bottom:2px; }
-  input { width:100%; padding:7px 8px; border:1px solid var(--bd); border-radius:6px; background:var(--bg); color:var(--fg); font:inherit; }
+  input, select { width:100%; padding:7px 8px; border:1px solid var(--bd); border-radius:6px; background:var(--bg); color:var(--fg); font:inherit; }
   .row { display:flex; gap:8px; } .row > div { flex:1; }
   .btns { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
   button { padding:8px 12px; border:1px solid var(--bd); border-radius:6px; background:var(--card); color:var(--fg); font:inherit; cursor:pointer; }
@@ -50,20 +50,17 @@
   <div class="right">
     <div class="card">
       <div class="row">
-        <div><label>Trắng</label><input id="white" list="presets" value="random"></div>
-        <div><label>Đen</label><input id="black" list="presets" value="random"></div>
+        <div>
+          <label>Trắng</label>
+          <select id="whiteSel"></select>
+          <input id="whiteModel" placeholder="model-id" style="display:none; margin-top:6px">
+        </div>
+        <div>
+          <label>Đen</label>
+          <select id="blackSel"></select>
+          <input id="blackModel" placeholder="model-id" style="display:none; margin-top:6px">
+        </div>
       </div>
-      <datalist id="presets">
-        <option value="random">
-        <option value="stockfish">
-        <option value="claude:claude-sonnet-5-5">
-        <option value="claude:claude-haiku-5-5">
-        <option value="claude:claude-opus-5-5">
-        <option value="gemini:">
-        <option value="groq:">
-        <option value="openrouter:">
-        <option value="ollama:">
-      </datalist>
       <div class="row" style="margin-top:8px">
         <div><label>Nghỉ giữa các nước (giây)</label><input id="delay" type="number" min="0" max="30" step="0.5" value="1"></div>
         <div><label>Giới hạn nửa-nước</label><input id="maxplies" type="number" min="10" max="400" value="200"></div>
@@ -74,7 +71,7 @@
         <button id="stop" disabled>Dừng</button>
         <button id="pgn" disabled>Tải PGN</button>
       </div>
-      <div class="hint">Gõ <b>loại:tên-model</b>, ví dụ <code>gemini:tên-model</code>. Chọn <code>random</code> để thử miễn phí.</div>
+      <div class="hint">Với Gemini/Groq/OpenRouter/Ollama, dán <b>model-id</b> lấy từ trang model của dịch vụ đó. Chọn <b>Random</b> hoặc <b>Stockfish</b> để chạy miễn phí.</div>
       <div id="err"></div>
     </div>
     <div class="card"><div id="log"></div></div>
@@ -182,10 +179,61 @@ async function call(path, body) {
   refresh();
 }
 
-$('start').onclick = () => call('/api/start', {
-  white: $('white').value, black: $('black').value,
-  delay: parseFloat($('delay').value) || 0, max_plies: parseInt($('maxplies').value) || 200,
-});
+const PLAYERS = [
+  ['random', 'Random (ngẫu nhiên)'],
+  ['stockfish', 'Stockfish (engine)'],
+  ['claude:claude-sonnet-5-5', 'Claude Sonnet 5.5'],
+  ['claude:claude-haiku-5-5', 'Claude Haiku 5.5'],
+  ['claude:claude-opus-5-5', 'Claude Opus 5.5'],
+  ['gemini', 'Gemini (nhập model-id)'],
+  ['groq', 'Groq (nhập model-id)'],
+  ['openrouter', 'OpenRouter (nhập model-id)'],
+  ['ollama', 'Ollama (nhập model-id)'],
+];
+const NEEDS_ID = ['gemini', 'groq', 'openrouter', 'ollama'];
+
+function setupSide(side) {
+  const sel = $(side + 'Sel'), inp = $(side + 'Model');
+  for (const [v, t] of PLAYERS) {
+    const o = document.createElement('option');
+    o.value = v; o.textContent = t;
+    sel.appendChild(o);
+  }
+  try {
+    const s = JSON.parse(localStorage.getItem('pick_' + side) || 'null');
+    if (s) {
+      if (PLAYERS.some(p => p[0] === s.sel)) sel.value = s.sel;
+      inp.value = s.model || '';
+    }
+  } catch (_) {}
+  const update = () => {
+    inp.style.display = NEEDS_ID.includes(sel.value) ? '' : 'none';
+    try { localStorage.setItem('pick_' + side, JSON.stringify({ sel: sel.value, model: inp.value })); } catch (_) {}
+  };
+  sel.onchange = update;
+  inp.oninput = update;
+  update();
+}
+setupSide('white');
+setupSide('black');
+
+function spec(side) {
+  const v = $(side + 'Sel').value;
+  if (NEEDS_ID.includes(v)) {
+    const m = $(side + 'Model').value.trim();
+    return m ? v + ':' + m : null;
+  }
+  return v;
+}
+
+$('start').onclick = () => {
+  const w = spec('white'), b = spec('black');
+  if (!w || !b) { $('err').textContent = 'Hãy nhập model-id cho bên đang chọn Gemini/Groq/OpenRouter/Ollama.'; return; }
+  call('/api/start', {
+    white: w, black: b,
+    delay: parseFloat($('delay').value) || 0, max_plies: parseInt($('maxplies').value) || 200,
+  });
+};
 $('pause').onclick = () => call('/api/pause');
 $('stop').onclick = () => call('/api/stop');
 $('pgn').onclick = async () => {
