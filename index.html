@@ -13,12 +13,15 @@
   * { box-sizing: border-box; }
   body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
   h1 { font-size:20px; margin:0 0 12px; }
+  h1 small { color:var(--muted); font-weight:400; font-size:12px; }
   .wrap { display:flex; flex-wrap:wrap; gap:16px; max-width:980px; margin:0 auto; }
   .card { background:var(--card); border:1px solid var(--bd); border-radius:10px; padding:12px; }
-  .left { flex:0 0 auto; width:min(94vw, 480px); }
+  .left { flex:0 0 auto; width:min(94vw, 504px); }
   .right { flex:1 1 300px; min-width:280px; display:flex; flex-direction:column; gap:12px; }
-  #board { display:grid; grid-template-columns:repeat(8,minmax(0,1fr)); grid-template-rows:repeat(8,minmax(0,1fr)); width:100%; aspect-ratio:1; border:2px solid var(--dark); container-type:inline-size; overflow:hidden; }
-  .sq { display:flex; align-items:center; justify-content:center; font-size:clamp(20px, 7vw, 44px); font-size:9.5cqw; line-height:1; min-width:0; min-height:0; overflow:hidden; }
+  #bw { width:100%; }
+  /* Kích thước ô do JS tính (--cell, đơn vị px) nên mọi ô luôn bằng nhau trên mọi trình duyệt */
+  #board { display:grid; grid-template-columns:repeat(8, var(--cell, 40px)); grid-auto-rows:var(--cell, 40px); width:max-content; border:2px solid var(--dark); margin:0 auto; }
+  .sq { width:var(--cell, 40px); height:var(--cell, 40px); display:flex; align-items:center; justify-content:center; font-size:calc(var(--cell, 40px) * 0.78); line-height:1; overflow:hidden; }
   .sq.l { background:var(--light); } .sq.d { background:var(--dark); } .sq.h { background:var(--hl); }
   .sq span { forced-color-adjust:none; }
   .w { color:#fff; -webkit-text-fill-color:#fff; text-shadow:0 0 2px #000,0 0 2px #000,0 0 2px #000,0 0 1px #000; }
@@ -27,7 +30,7 @@
   .players { color:var(--muted); font-size:13px; }
   label { display:block; font-size:13px; color:var(--muted); margin-bottom:2px; }
   input, select { width:100%; padding:7px 8px; border:1px solid var(--bd); border-radius:6px; background:var(--bg); color:var(--fg); font:inherit; }
-  .row { display:flex; gap:8px; } .row > div { flex:1; }
+  .row { display:flex; gap:8px; } .row > div { flex:1; min-width:0; }
   .btns { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
   button { padding:8px 12px; border:1px solid var(--bd); border-radius:6px; background:var(--card); color:var(--fg); font:inherit; cursor:pointer; }
   button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
@@ -41,8 +44,8 @@
 <body>
 <div class="wrap">
   <div class="left card">
-    <h1>Chess AI Arena</h1>
-    <div id="board"></div>
+    <h1>Chess AI Arena <small>v4</small></h1>
+    <div id="bw"><div id="board"></div></div>
     <div id="status">Đang tải...</div>
     <div class="players" id="players"></div>
   </div>
@@ -50,16 +53,8 @@
   <div class="right">
     <div class="card">
       <div class="row">
-        <div>
-          <label>Trắng</label>
-          <select id="whiteSel"></select>
-          <input id="whiteModel" placeholder="model-id" style="display:none; margin-top:6px">
-        </div>
-        <div>
-          <label>Đen</label>
-          <select id="blackSel"></select>
-          <input id="blackModel" placeholder="model-id" style="display:none; margin-top:6px">
-        </div>
+        <div><label>Trắng</label><select id="whiteSel"></select></div>
+        <div><label>Đen</label><select id="blackSel"></select></div>
       </div>
       <div class="row" style="margin-top:8px">
         <div><label>Nghỉ giữa các nước (giây)</label><input id="delay" type="number" min="0" max="30" step="0.5" value="1"></div>
@@ -70,8 +65,9 @@
         <button id="pause" disabled>Tạm dừng</button>
         <button id="stop" disabled>Dừng</button>
         <button id="pgn" disabled>Tải PGN</button>
+        <button id="reload">Tải lại danh sách model</button>
       </div>
-      <div class="hint">Với Gemini/Groq/OpenRouter/Ollama, dán <b>model-id</b> lấy từ trang model của dịch vụ đó. Chọn <b>Random</b> hoặc <b>Stockfish</b> để chạy miễn phí.</div>
+      <div class="hint" id="notes"></div>
       <div id="err"></div>
     </div>
     <div class="card"><div id="log"></div></div>
@@ -95,6 +91,14 @@ async function api(path, opt = {}) {
   }
   return r;
 }
+
+/* ---- bàn cờ ---- */
+function sizeBoard() {
+  const avail = $('bw').clientWidth - 4;
+  const cell = Math.max(24, Math.floor(Math.min(avail, 480) / 8));
+  $('board').style.setProperty('--cell', cell + 'px');
+}
+window.addEventListener('resize', sizeBoard);
 
 function renderBoard(fen, last) {
   const board = $('board');
@@ -179,63 +183,46 @@ async function call(path, body) {
   refresh();
 }
 
-const PLAYERS = [
-  ['random', 'Random (ngẫu nhiên)'],
-  ['stockfish', 'Stockfish (engine)'],
-  ['claude:claude-sonnet-5-5', 'Claude Sonnet 5.5'],
-  ['claude:claude-haiku-5-5', 'Claude Haiku 5.5'],
-  ['claude:claude-opus-5-5', 'Claude Opus 5.5'],
-  ['gemini', 'Gemini (nhập model-id)'],
-  ['groq', 'Groq (nhập model-id)'],
-  ['openrouter', 'OpenRouter (nhập model-id)'],
-  ['ollama', 'Ollama (nhập model-id)'],
-];
-const NEEDS_ID = ['gemini', 'groq', 'openrouter', 'ollama'];
+/* ---- menu chọn người chơi: chỉ có lựa chọn do server cung cấp ---- */
+const SIDES = ['white', 'black'];
+function saved(side) { try { return localStorage.getItem('pick_' + side) || ''; } catch (_) { return ''; } }
 
-function setupSide(side) {
-  const sel = $(side + 'Sel'), inp = $(side + 'Model');
-  for (const [v, t] of PLAYERS) {
-    const o = document.createElement('option');
-    o.value = v; o.textContent = t;
-    sel.appendChild(o);
-  }
+async function loadModels(force) {
+  let data;
   try {
-    const s = JSON.parse(localStorage.getItem('pick_' + side) || 'null');
-    if (s) {
-      if (PLAYERS.some(p => p[0] === s.sel)) sel.value = s.sel;
-      inp.value = s.model || '';
-    }
-  } catch (_) {}
-  const update = () => {
-    inp.style.display = NEEDS_ID.includes(sel.value) ? '' : 'none';
-    try { localStorage.setItem('pick_' + side, JSON.stringify({ sel: sel.value, model: inp.value })); } catch (_) {}
-  };
-  sel.onchange = update;
-  inp.oninput = update;
-  update();
-}
-setupSide('white');
-setupSide('black');
-
-function spec(side) {
-  const v = $(side + 'Sel').value;
-  if (NEEDS_ID.includes(v)) {
-    const m = $(side + 'Model').value.trim();
-    return m ? v + ':' + m : null;
+    data = await (await api('/api/models' + (force ? '?refresh=true' : ''))).json();
+  } catch (_) {
+    data = { groups: [{ label: 'Cơ bản', items: [
+      { spec: 'random', label: 'Random (ngẫu nhiên)' }, { spec: 'stockfish', label: 'Stockfish (engine)' } ] }],
+      notes: ['Không tải được danh sách model'] };
   }
-  return v;
+  for (const side of SIDES) {
+    const sel = $(side + 'Sel');
+    const keep = sel.value || saved(side);
+    sel.innerHTML = '';
+    for (const g of data.groups) {
+      const og = document.createElement('optgroup');
+      og.label = g.label;
+      for (const it of g.items) {
+        const o = document.createElement('option');
+        o.value = it.spec; o.textContent = it.label;
+        og.appendChild(o);
+      }
+      sel.appendChild(og);
+    }
+    if ([...sel.options].some(o => o.value === keep)) sel.value = keep;
+    sel.onchange = () => { try { localStorage.setItem('pick_' + side, sel.value); } catch (_) {} };
+  }
+  $('notes').textContent = data.notes.length ? data.notes.join(' · ') : '';
 }
 
-$('start').onclick = () => {
-  const w = spec('white'), b = spec('black');
-  if (!w || !b) { $('err').textContent = 'Hãy nhập model-id cho bên đang chọn Gemini/Groq/OpenRouter/Ollama.'; return; }
-  call('/api/start', {
-    white: w, black: b,
-    delay: parseFloat($('delay').value) || 0, max_plies: parseInt($('maxplies').value) || 200,
-  });
-};
+$('start').onclick = () => call('/api/start', {
+  white: $('whiteSel').value, black: $('blackSel').value,
+  delay: parseFloat($('delay').value) || 0, max_plies: parseInt($('maxplies').value) || 200,
+});
 $('pause').onclick = () => call('/api/pause');
 $('stop').onclick = () => call('/api/stop');
+$('reload').onclick = () => loadModels(true);
 $('pgn').onclick = async () => {
   const r = await api('/api/pgn');
   if (!r.ok) return;
@@ -246,8 +233,9 @@ $('pgn').onclick = async () => {
 };
 
 async function loop() { await refresh(); setTimeout(loop, 1000); }
-loop();
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+sizeBoard();
+refresh().then(() => loadModels(false)).then(loop);
 </script>
 </body>
 </html>

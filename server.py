@@ -170,6 +170,69 @@ def healthz():
     return "ok"
 
 
+_models_cache = {"t": 0.0, "data": None}
+_EXCLUDE = ("whisper", "tts", "guard", "embed", "imagen", "veo", "image", "aqa", "audio",
+            "orpheus", "playai", "moderation", "transcribe", "live", "robotics")
+PROVIDER_LABELS = {"gemini": "Gemini", "groq": "Groq", "openrouter": "OpenRouter (miễn phí)", "ollama": "Ollama (local)"}
+
+
+def _list_models(provider):
+    from openai import OpenAI
+    from players import PRESETS
+
+    base_url, key_env = PRESETS[provider]
+    api_key = os.environ.get(key_env, "") if key_env else "ollama"
+    client = OpenAI(base_url=base_url, api_key=api_key, timeout=8 if key_env else 2)
+    ids = [m.id.replace("models/", "", 1) for m in client.models.list().data]
+    if provider == "openrouter":
+        ids = [i for i in ids if i.endswith(":free")]
+    elif provider == "gemini":
+        ids = [i for i in ids if i.startswith(("gemini", "gemma"))]
+    ids = [i for i in ids if not any(x in i.lower() for x in _EXCLUDE)]
+    return sorted(set(ids))
+
+
+@app.get("/api/models", dependencies=[Depends(auth)])
+def models(refresh: bool = False):
+    """Danh sách lựa chọn cho menu: chỉ hiện dịch vụ đã có API key, lấy model-id thật từ dịch vụ."""
+    now = time.time()
+    if not refresh and _models_cache["data"] and now - _models_cache["t"] < 600:
+        return _models_cache["data"]
+    groups = [{"label": "Cơ bản", "items": [
+        {"spec": "random", "label": "Random (ngẫu nhiên)"},
+        {"spec": "stockfish", "label": "Stockfish (engine)"},
+    ]}]
+    notes = []
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        groups.append({"label": "Claude", "items": [
+            {"spec": "claude:claude-sonnet-5-5", "label": "Claude Sonnet 5.5"},
+            {"spec": "claude:claude-haiku-5-5", "label": "Claude Haiku 5.5"},
+            {"spec": "claude:claude-opus-5-5", "label": "Claude Opus 5.5"},
+        ]})
+    else:
+        notes.append("Chưa đặt ANTHROPIC_API_KEY")
+    from players import PRESETS
+    for provider in ("gemini", "groq", "openrouter", "ollama"):
+        key_env = PRESETS[provider][1]
+        if key_env and not os.environ.get(key_env):
+            notes.append(f"Chưa đặt {key_env}")
+            continue
+        if provider == "ollama" and os.environ.get("RENDER"):
+            continue  # Ollama không chạy được trên Render
+        try:
+            ids = _list_models(provider)
+        except Exception as e:
+            if provider != "ollama":
+                notes.append(f"{PROVIDER_LABELS[provider]}: không lấy được danh sách ({type(e).__name__})")
+            continue
+        if ids:
+            groups.append({"label": PROVIDER_LABELS[provider],
+                           "items": [{"spec": f"{provider}:{i}", "label": i} for i in ids]})
+    data = {"groups": groups, "notes": notes}
+    _models_cache.update(t=now, data=data)
+    return data
+
+
 @app.get("/api/state", dependencies=[Depends(auth)])
 def state():
     if current is None:
