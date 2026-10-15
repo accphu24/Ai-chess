@@ -12,9 +12,11 @@ Khi đưa lên mạng, đặt ACCESS_TOKEN để chỉ mình bạn dùng đượ
 
 import datetime
 import hmac
+import json
 import os
 import threading
 import time
+import uuid
 
 import chess
 import chess.pgn
@@ -33,6 +35,110 @@ app = FastAPI(title="Chess AI Arena")
 def auth(x_token: str = Header(default="")):
     if ACCESS_TOKEN and not hmac.compare_digest(x_token, ACCESS_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+# ---------------------------------------------------------------------------
+# Kết quả các ván đã chơi + bảng xếp hạng (Elo)
+# Lưu vào data/results.json. Lưu ý: ổ đĩa Render gói miễn phí bị xóa khi deploy lại,
+# nên trình duyệt cũng giữ một bản và tự đồng bộ ngược lên server.
+# ---------------------------------------------------------------------------
+DATA_DIR = os.environ.get("DATA_DIR", os.path.join(BASE_DIR, "data"))
+RESULTS_FILE = os.path.join(DATA_DIR, "results.json")
+RESULTS_LOCK = threading.Lock()
+VALID_RESULTS = {"1-0", "0-1", "1/2-1/2", "*"}
+MAX_RESULTS = 5000
+ELO_START, ELO_K = 1000.0, 32.0
+
+
+def _clean_result(r):
+    try:
+        res = str(r["result"])
+        if res not in VALID_RESULTS:
+            return None
+        return {"id": str(r["id"])[:64], "ts": float(r["ts"]),
+                "white": str(r["white"])[:120], "black": str(r["black"])[:120],
+                "result": res, "reason": str(r.get("reason", ""))[:60], "plies": int(r.get("plies", 0)),
+                "wm": int(r.get("wm", 0)), "wf": int(r.get("wf", 0)),
+                "bm": int(r.get("bm", 0)), "bf": int(r.get("bf", 0))}
+    except Exception:
+        return None
+
+
+def _load_results():
+    try:
+        with open(RESULTS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return [r for r in (_clean_result(x) for x in data) if r]
+    except Exception:
+        return []
+
+
+def _save_results():  # gọi khi đang giữ RESULTS_LOCK
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = RESULTS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(RESULTS, f, ensure_ascii=False)
+        os.replace(tmp, RESULTS_FILE)
+    except Exception:
+        pass  # ổ đĩa chỉ đọc: bỏ qua, trình duyệt vẫn giữ bản sao
+
+
+RESULTS = _load_results()
+
+
+def add_result(rec):
+    with RESULTS_LOCK:
+        RESULTS.append(rec)
+        _save_results()
+
+
+def merge_results(items):
+    added = 0
+    with RESULTS_LOCK:
+        ids = {r["id"] for r in RESULTS}
+        for item in items:
+            r = _clean_result(item)
+            if r and r["id"] not in ids and len(RESULTS) < MAX_RESULTS:
+                RESULTS.append(r)
+                ids.add(r["id"])
+                added += 1
+        if added:
+            _save_results()
+    return added
+
+
+def compute_leaderboard(results):
+    """Elo tính lại từ đầu theo thứ tự thời gian. Ván cùng một model hai bên không được tính."""
+    stats = {}
+
+    def get(name):
+        return stats.setdefault(name, {"name": name, "elo": ELO_START, "games": 0, "w": 0, "d": 0, "l": 0,
+                                       "points": 0.0, "moves": 0, "fallbacks": 0})
+
+    for r in sorted(results, key=lambda x: x["ts"]):
+        if r["white"] == r["black"]:
+            continue
+        w, b = get(r["white"]), get(r["black"])
+        sw = 1.0 if r["result"] == "1-0" else 0.0 if r["result"] == "0-1" else 0.5  # "*" (hết giới hạn nước) = hòa
+        exp_w = 1.0 / (1.0 + 10 ** ((b["elo"] - w["elo"]) / 400.0))
+        w["elo"] += ELO_K * (sw - exp_w)
+        b["elo"] += ELO_K * ((1.0 - sw) - (1.0 - exp_w))
+        for side, s in ((w, sw), (b, 1.0 - sw)):
+            side["games"] += 1
+            side["points"] += s
+            side["w" if s == 1.0 else "l" if s == 0.0 else "d"] += 1
+        w["moves"] += r["wm"]; w["fallbacks"] += r["wf"]
+        b["moves"] += r["bm"]; b["fallbacks"] += r["bf"]
+
+    rows = []
+    for s in stats.values():
+        rows.append({"name": s["name"], "elo": round(s["elo"]), "games": s["games"],
+                     "w": s["w"], "d": s["d"], "l": s["l"],
+                     "score_pct": round(100.0 * s["points"] / s["games"], 1) if s["games"] else 0.0,
+                     "illegal_pct": round(100.0 * s["fallbacks"] / s["moves"], 1) if s["moves"] else 0.0})
+    rows.sort(key=lambda x: (-x["elo"], -x["score_pct"], x["name"]))
+    return rows
+
 
 
 class Game:
@@ -56,6 +162,8 @@ class Game:
         self.result = "*"
         self.last = None
         self.log = []
+        self.moves = {chess.WHITE: 0, chess.BLACK: 0}
+        self.fallbacks = {chess.WHITE: 0, chess.BLACK: 0}
         self.thread = threading.Thread(target=self.run, daemon=True)
 
     # ---- trạng thái ----
@@ -91,6 +199,13 @@ class Game:
             game.headers["Black"] = self.players[chess.BLACK].name
             game.headers["Result"] = self.result
             return str(game)
+
+    def _record(self):  # gọi khi đang giữ self.lock
+        return {"id": uuid.uuid4().hex, "ts": time.time(),
+                "white": self.players[chess.WHITE].name, "black": self.players[chess.BLACK].name,
+                "result": self.result, "reason": self.message, "plies": len(self.board.move_stack),
+                "wm": self.moves[chess.WHITE], "wf": self.fallbacks[chess.WHITE],
+                "bm": self.moves[chess.BLACK], "bf": self.fallbacks[chess.BLACK]}
 
     # ---- vòng lặp ván cờ ----
     def _sleep(self, seconds):
@@ -137,6 +252,7 @@ class Game:
                         else:
                             self.result = "*"
                             self.message = "ĐẠT GIỚI HẠN SỐ NƯỚC"
+                        add_result(self._record())
                         self.status = "finished"
                         self.phase = "idle"
                     return
@@ -171,6 +287,9 @@ class Game:
                     self.log.append({"n": number, "white": turn == chess.WHITE, "san": san,
                                      "who": player.name, "note": note or ""})
                     self.board.push(move)
+                    self.moves[turn] += 1
+                    if (note or "").startswith("⚠"):
+                        self.fallbacks[turn] += 1
                     self.last = move.uci()
                     self.phase = "idle"
                 if not self.manual:
@@ -220,7 +339,7 @@ def _list_models(provider):
 
     base_url, key_env = PRESETS[provider]
     api_key = os.environ.get(key_env, "") if key_env else "ollama"
-    client = OpenAI(base_url=base_url, api_key=api_key, timeout=8 if key_env else 2)
+    client = OpenAI(base_url=base_url, api_key=api_key, timeout=8 if key_env else 1.5, max_retries=0)
     ids = [m.id.replace("models/", "", 1) for m in client.models.list().data]
     if provider == "openrouter":
         ids = [i for i in ids if i.endswith(":free")]
@@ -274,10 +393,12 @@ def models(refresh: bool = False):
 @app.get("/api/state", dependencies=[Depends(auth)])
 def state():
     if current is None:
-        return {"status": "idle", "paused": False, "manual": True, "phase": "idle", "error": "",
+        return {"results_count": len(RESULTS), "status": "idle", "paused": False, "manual": True, "phase": "idle", "error": "",
                 "can_continue": False, "turn": "white", "message": "", "result": "*",
                 "fen": chess.STARTING_FEN, "last": None, "white": "", "black": "", "log": []}
-    return current.snapshot()
+    data = current.snapshot()
+    data["results_count"] = len(RESULTS)
+    return data
 
 
 @app.post("/api/start", dependencies=[Depends(auth)])
@@ -355,3 +476,35 @@ def pgn():
     if current is None:
         raise HTTPException(404, "Chưa có ván nào.")
     return current.pgn()
+
+
+# ---- bảng xếp hạng ----
+class ResultsIn(BaseModel):
+    results: list = []
+
+
+@app.get("/api/leaderboard", dependencies=[Depends(auth)])
+def leaderboard():
+    with RESULTS_LOCK:
+        snapshot = list(RESULTS)
+    recent = sorted(snapshot, key=lambda r: r["ts"], reverse=True)[:15]
+    return {"leaderboard": compute_leaderboard(snapshot), "recent": recent, "total": len(snapshot)}
+
+
+@app.get("/api/results", dependencies=[Depends(auth)])
+def get_results():
+    with RESULTS_LOCK:
+        return {"results": list(RESULTS)}
+
+
+@app.post("/api/results/import", dependencies=[Depends(auth)])
+def import_results(req: ResultsIn):
+    return {"added": merge_results(req.results[:MAX_RESULTS])}
+
+
+@app.delete("/api/results", dependencies=[Depends(auth)])
+def clear_results():
+    with RESULTS_LOCK:
+        RESULTS.clear()
+        _save_results()
+    return {"ok": True}

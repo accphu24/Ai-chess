@@ -42,13 +42,22 @@
   #log { max-height:340px; overflow:auto; font-size:14px; }
   .mv { font-weight:600; margin-top:6px; } .note { color:var(--muted); font-size:13px; white-space:pre-wrap; }
   .hint { font-size:12px; color:var(--muted); margin-top:6px; }
+  h2 { font-size:16px; margin:0 0 8px; }
+  .tbl { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { padding:5px 6px; text-align:right; border-bottom:1px solid var(--bd); white-space:nowrap; }
+  th:nth-child(2), td:nth-child(2) { text-align:left; white-space:normal; word-break:break-word; min-width:110px; }
+  th { color:var(--muted); font-weight:600; font-size:12px; }
+  td.elo { font-weight:700; }
+  details { margin-top:10px; font-size:13px; } summary { cursor:pointer; color:var(--muted); }
+  .hrow { padding:4px 0; border-bottom:1px solid var(--bd); word-break:break-word; }
   #err { color:#c53030; font-size:13px; margin-top:6px; min-height:1em; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <div class="left card">
-    <h1>Chess AI Arena <small>v5</small></h1>
+    <h1>Chess AI Arena <small>v6</small></h1>
     <div id="bw"><div id="board"></div></div>
     <div id="status">Đang tải...</div>
     <div class="players" id="players"></div>
@@ -77,6 +86,13 @@
       <div id="err"></div>
     </div>
     <div class="card"><div id="log"></div></div>
+    <div class="card">
+      <h2>Bảng xếp hạng</h2>
+      <div class="tbl"><table id="lb"></table></div>
+      <div class="hint" id="lbnote"></div>
+      <details><summary>Lịch sử ván đấu gần đây</summary><div id="hist"></div></details>
+      <div class="btns"><button id="clearlb">Xóa bảng xếp hạng</button></div>
+    </div>
   </div>
 </div>
 
@@ -170,6 +186,7 @@ async function refresh() {
     const s = await (await api('/api/state')).json();
     renderBoard(s.fen, s.last);
     renderLog(s.log);
+    if (s.results_count !== undefined) onResultsChanged(s.results_count);
     $('status').textContent = statusText(s);
     $('status').className = s.status !== 'running' ? '' : (s.phase === 'ready' ? 'ready' : (s.phase === 'error' ? 'warn' : ''));
     $('players').textContent = s.white ? `Trắng: ${s.white}  ·  Đen: ${s.black}` : '';
@@ -248,6 +265,88 @@ $('pgn').onclick = async () => {
   a.href = url; a.download = 'game.pgn'; a.click();
   URL.revokeObjectURL(url);
 };
+
+
+/* ---- bảng xếp hạng ---- */
+const REASONS = {
+  CHECKMATE: 'chiếu bí', STALEMATE: 'hết nước đi (hòa)', INSUFFICIENT_MATERIAL: 'không đủ quân',
+  FIFTY_MOVES: 'luật 50 nước', SEVENTYFIVE_MOVES: 'luật 75 nước',
+  THREEFOLD_REPETITION: 'lặp thế cờ', FIVEFOLD_REPETITION: 'lặp thế cờ',
+};
+const RESULT_TEXT = { '1-0': 'Trắng thắng', '0-1': 'Đen thắng', '1/2-1/2': 'Hòa', '*': 'Hòa (hết giới hạn nước)' };
+
+function cellOf(tag, text, cls) {
+  const c = document.createElement(tag);
+  c.textContent = text;
+  if (cls) c.className = cls;
+  return c;
+}
+
+async function loadLeaderboard() {
+  try {
+    const d = await (await api('/api/leaderboard')).json();
+    const t = $('lb');
+    t.innerHTML = '';
+    const head = document.createElement('tr');
+    [['#', ''], ['Model', ''], ['Elo', 'Điểm Elo, khởi đầu 1000'], ['T-H-B', 'Thắng - Hòa - Bại'],
+     ['Điểm', '% điểm (thắng 1, hòa 0,5)'], ['Sai luật', '% nước AI trả sai luật quá số lần thử, bị thay bằng nước ngẫu nhiên']]
+      .forEach(([h, tip]) => { const th = cellOf('th', h); if (tip) th.title = tip; head.appendChild(th); });
+    t.appendChild(head);
+    d.leaderboard.forEach((r, i) => {
+      const tr = document.createElement('tr');
+      tr.appendChild(cellOf('td', i + 1));
+      tr.appendChild(cellOf('td', r.name));
+      tr.appendChild(cellOf('td', r.elo, 'elo'));
+      tr.appendChild(cellOf('td', `${r.w}-${r.d}-${r.l}`));
+      tr.appendChild(cellOf('td', r.score_pct + '%'));
+      tr.appendChild(cellOf('td', r.illegal_pct + '%'));
+      t.appendChild(tr);
+    });
+    $('lbnote').textContent = d.leaderboard.length
+      ? 'Elo khởi đầu 1000, K=32. Cần nhiều ván mới đáng tin; nên cho model đấu với Random/Stockfish làm mốc. Ván hai bên cùng model, ván bị dừng giữa chừng không được tính; ván hết giới hạn nước tính là hòa.'
+      : 'Chưa có ván nào được tính. Hãy cho hai model khác nhau đấu một ván hoàn chỉnh (ván cùng model hai bên không được tính).';
+    const h = $('hist');
+    h.innerHTML = '';
+    for (const r of d.recent) {
+      const row = document.createElement('div');
+      row.className = 'hrow';
+      const reason = REASONS[r.reason] || r.reason;
+      row.textContent = `${r.white} (Trắng) vs ${r.black} (Đen): ${RESULT_TEXT[r.result] || r.result}, ${Math.ceil(r.plies / 2)} nước${reason ? ' · ' + reason : ''}`;
+      h.appendChild(row);
+    }
+  } catch (_) {}
+}
+
+/* Server (Render miễn phí) có thể mất dữ liệu khi deploy lại → giữ bản sao trong trình duyệt và đồng bộ ngược */
+async function syncResults() {
+  try {
+    const server = (await (await api('/api/results')).json()).results;
+    let local = [];
+    try { local = JSON.parse(localStorage.getItem('results') || '[]'); } catch (_) {}
+    const map = new Map();
+    for (const r of local.concat(server)) if (r && r.id) map.set(r.id, r);
+    const merged = [...map.values()];
+    if (merged.length > server.length) {
+      await api('/api/results/import', { method: 'POST', body: JSON.stringify({ results: merged }) });
+    }
+    try { localStorage.setItem('results', JSON.stringify(merged)); } catch (_) {}
+  } catch (_) {}
+}
+
+$('clearlb').onclick = async () => {
+  if (!confirm('Xóa toàn bộ bảng xếp hạng và lịch sử ván đấu?')) return;
+  await api('/api/results', { method: 'DELETE' });
+  try { localStorage.removeItem('results'); } catch (_) {}
+  loadLeaderboard();
+};
+
+let lastCount = null;
+async function onResultsChanged(count) {
+  if (count === lastCount) return;
+  lastCount = count;
+  await syncResults();
+  await loadLeaderboard();
+}
 
 async function loop() { await refresh(); setTimeout(loop, 1000); }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
