@@ -51,13 +51,22 @@
   td.elo { font-weight:700; }
   details { margin-top:10px; font-size:13px; } summary { cursor:pointer; color:var(--muted); }
   .hrow { padding:4px 0; border-bottom:1px solid var(--bd); word-break:break-word; }
+  .tabs { display:flex; gap:6px; margin-bottom:10px; }
+  .tab { flex:1; }
+  .tab.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .chooser { max-height:210px; overflow:auto; border:1px solid var(--bd); border-radius:6px; padding:4px 8px; background:var(--bg); }
+  .chooser .gl { font-size:12px; color:var(--muted); margin:6px 0 2px; font-weight:600; }
+  .opt { display:flex; align-items:center; gap:6px; font-size:13px; color:var(--fg); margin:0; padding:3px 0; word-break:break-all; }
+  .opt input { width:auto; }
+  .btns .g { display:contents; }
+  #tourGames { max-height:220px; overflow:auto; }
   #err { color:#c53030; font-size:13px; margin-top:6px; min-height:1em; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <div class="left card">
-    <h1>Chess AI Arena <small>v7</small></h1>
+    <h1>Chess AI Arena <small>v8</small></h1>
     <div id="bw"><div id="board"></div></div>
     <div id="status">Đang tải...</div>
     <div class="players" id="players"></div>
@@ -65,25 +74,55 @@
 
   <div class="right">
     <div class="card">
-      <div class="row">
-        <div><label>Trắng</label><select id="whiteSel"></select></div>
-        <div><label>Đen</label><select id="blackSel"></select></div>
+      <div class="tabs">
+        <button class="tab on" id="tabSingle">Ván đơn</button>
+        <button class="tab" id="tabTour">Giải vòng tròn</button>
       </div>
+
+      <div id="singlePanel">
+        <div class="row">
+          <div><label>Trắng</label><select id="whiteSel"></select></div>
+          <div><label>Đen</label><select id="blackSel"></select></div>
+        </div>
+        <div class="hint" id="pickHint" style="display:none">🎲 Server bốc ngẫu nhiên từ các model AI trong danh sách (kể cả Claude nếu đã đặt key, có thể tốn phí). Tên model được chọn hiện ngay khi ván bắt đầu.</div>
+      </div>
+
+      <div id="tourPanel" style="display:none">
+        <label>Chọn các model tham gia (2–8)</label>
+        <div class="chooser" id="tourList"></div>
+        <div class="row" style="margin-top:8px">
+          <div><label>Số ván mỗi cặp</label>
+            <select id="gpp"><option value="2" selected>2 (đổi màu 1 lần)</option><option value="1">1</option><option value="4">4</option></select></div>
+        </div>
+        <div class="hint" id="tourInfo"></div>
+      </div>
+
       <div class="row" style="margin-top:8px">
         <div><label>Nghỉ giữa các nước (giây)</label><input id="delay" type="number" min="0" max="30" step="0.5" value="1"></div>
         <div><label>Giới hạn nửa-nước</label><input id="maxplies" type="number" min="10" max="400" value="200"></div>
       </div>
-      <label class="chk"><input type="checkbox" id="manual" checked>Chế độ từng nước: AI nghĩ xong thì chờ tôi bấm "Tiếp tục" mới đi</label>
+      <label class="chk" id="manualWrap"><input type="checkbox" id="manual" checked>Chế độ từng nước: AI nghĩ xong thì chờ tôi bấm "Tiếp tục" mới đi</label>
       <div class="btns">
-        <button class="primary" id="start">Bắt đầu ván mới</button>
-        <button class="primary" id="cont" disabled>Tiếp tục</button>
-        <button id="pause" disabled>Tạm dừng</button>
+        <div class="g" id="singleBtns">
+          <button class="primary" id="start">Bắt đầu ván mới</button>
+          <button class="primary" id="cont" disabled>Tiếp tục</button>
+          <button id="pause" disabled>Tạm dừng</button>
+        </div>
+        <div class="g" id="tourBtns" style="display:none">
+          <button class="primary" id="startTour">Bắt đầu giải</button>
+        </div>
         <button id="stop" disabled>Dừng</button>
         <button id="pgn" disabled>Tải PGN</button>
         <button id="reload">Tải lại danh sách model</button>
       </div>
       <div class="hint" id="notes"></div>
       <div id="err"></div>
+    </div>
+    <div class="card" id="tourCard" style="display:none">
+      <h2>Giải đấu</h2>
+      <div id="tourStatus" style="font-weight:600; margin-bottom:6px"></div>
+      <div class="tbl"><table id="tourTable"></table></div>
+      <details open><summary>Các ván trong giải</summary><div id="tourGames"></div></details>
     </div>
     <div class="card"><div id="log"></div></div>
     <div class="card">
@@ -169,6 +208,15 @@ function renderLog(log) {
 }
 
 function statusText(s) {
+  const T = s.tournament;
+  if (T && T.active) {
+    const pre = `🏆 Giải đấu, ván ${T.index}/${T.total}: `;
+    return pre + (s.status === 'running' ? gameStatusText(s) : 'đang chuẩn bị ván tiếp theo...');
+  }
+  return gameStatusText(s);
+}
+
+function gameStatusText(s) {
   if (s.status === 'idle') return 'Chưa có ván nào. Chọn người chơi rồi bấm "Bắt đầu".';
   if (s.status === 'error') return 'Lỗi: ' + s.message;
   if (s.status === 'stopped') return 'Đã dừng ván.';
@@ -191,11 +239,18 @@ async function refresh() {
     $('status').textContent = statusText(s);
     $('status').className = s.status !== 'running' ? '' : (s.phase === 'ready' ? 'ready' : (s.phase === 'error' ? 'warn' : ''));
     $('players').textContent = s.white ? `Trắng: ${s.white}  ·  Đen: ${s.black}` : '';
+    const T = s.tournament;
+    const tourActive = !!(T && T.active);
+    renderTournament(T);
+    if (tourActive && !autoSwitched) { autoSwitched = true; setMode('tour'); }
     const running = s.status === 'running';
-    $('start').disabled = running;
-    $('cont').disabled = !s.can_continue;
-    $('pause').disabled = !running || s.manual || s.paused;
-    $('stop').disabled = !running;
+    const busy = running || tourActive;
+    $('start').disabled = busy;
+    $('startTour').disabled = busy;
+    $('cont').disabled = tourActive || !s.can_continue;
+    $('pause').disabled = tourActive || !running || s.manual || s.paused;
+    $('stop').disabled = !busy;
+    $('stop').textContent = tourActive ? 'Dừng giải' : 'Dừng';
     $('pgn').disabled = s.status === 'idle';
   } catch (e) { $('status').textContent = e.message; }
 }
@@ -239,8 +294,10 @@ async function loadModels(force) {
       sel.appendChild(og);
     }
     if ([...sel.options].some(o => o.value === keep)) sel.value = keep;
-    sel.onchange = () => { try { localStorage.setItem('pick_' + side, sel.value); } catch (_) {} };
+    sel.onchange = () => { try { localStorage.setItem('pick_' + side, sel.value); } catch (_) {} updatePickHint(); };
   }
+  updatePickHint();
+  buildTourList(data);
   $('notes').textContent = data.notes.length ? data.notes.join(' · ') : '';
 }
 
@@ -249,6 +306,117 @@ $('start').onclick = () => call('/api/start', {
   delay: parseFloat($('delay').value) || 0, max_plies: parseInt($('maxplies').value) || 200,
   manual: $('manual').checked,
 });
+
+/* ---- chế độ ván đơn / giải đấu ---- */
+let autoSwitched = false;
+function setMode(m) {
+  $('singlePanel').style.display = m === 'single' ? '' : 'none';
+  $('tourPanel').style.display = m === 'tour' ? '' : 'none';
+  $('singleBtns').style.display = m === 'single' ? 'contents' : 'none';
+  $('tourBtns').style.display = m === 'tour' ? 'contents' : 'none';
+  $('manualWrap').style.display = m === 'single' ? '' : 'none';
+  $('tabSingle').classList.toggle('on', m === 'single');
+  $('tabTour').classList.toggle('on', m === 'tour');
+  $('err').textContent = '';
+}
+$('tabSingle').onclick = () => setMode('single');
+$('tabTour').onclick = () => setMode('tour');
+
+function updatePickHint() {
+  $('pickHint').style.display = SIDES.some(sd => $(sd + 'Sel').value === 'pick:random') ? '' : 'none';
+}
+
+let tourSel = new Set();
+try { tourSel = new Set(JSON.parse(localStorage.getItem('tourSel') || '[]')); } catch (_) {}
+const llmCount = spec => (spec === 'random' || spec === 'stockfish') ? 0 : 1;
+
+function updateTourInfo() {
+  const sel = [...tourSel], n = sel.length;
+  const gpp = parseInt($('gpp').value) || 2, maxp = parseInt($('maxplies').value) || 200;
+  const games = n * (n - 1) / 2 * gpp;
+  let calls = 0;
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) calls += (llmCount(sel[i]) + llmCount(sel[j])) * (maxp / 2) * gpp;
+  let txt = `Đã chọn ${n}/8.`;
+  if (n < 2) txt += ' Chọn ít nhất 2.';
+  else {
+    txt += ` Tổng ${games} ván`;
+    txt += calls ? `, tối đa ~${Math.round(calls)} lượt gọi API (chưa tính thử lại). Gói miễn phí hay bị giới hạn nên nên nghỉ 2-5 giây giữa các nước.` : '.';
+  }
+  if (n > 8) txt += ' ⚠ Quá 8 model.'; else if (games > 60) txt += ' ⚠ Vượt 60 ván.';
+  if (gpp === 1 && n >= 2) txt += ' (1 ván mỗi cặp thì màu quân không cân bằng.)';
+  $('tourInfo').textContent = txt;
+}
+
+function buildTourList(data) {
+  const box = $('tourList');
+  box.innerHTML = '';
+  const avail = new Set();
+  for (const g of data.groups) {
+    if (g.label === 'Đặc biệt') continue;
+    const title = document.createElement('div');
+    title.className = 'gl'; title.textContent = g.label;
+    box.appendChild(title);
+    for (const it of g.items) {
+      avail.add(it.spec);
+      const lab = document.createElement('label');
+      lab.className = 'opt';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.value = it.spec; cb.checked = tourSel.has(it.spec);
+      cb.onchange = () => {
+        if (cb.checked) tourSel.add(it.spec); else tourSel.delete(it.spec);
+        try { localStorage.setItem('tourSel', JSON.stringify([...tourSel])); } catch (_) {}
+        updateTourInfo();
+      };
+      lab.appendChild(cb);
+      lab.appendChild(document.createTextNode(it.label));
+      box.appendChild(lab);
+    }
+  }
+  tourSel = new Set([...tourSel].filter(s => avail.has(s)));
+  updateTourInfo();
+}
+
+function renderTournament(T) {
+  const card = $('tourCard');
+  if (!T) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  $('tourStatus').textContent = T.status === 'running' ? `🏆 Đang chạy: ván ${T.index}/${T.total}`
+    : T.status === 'finished' ? `🏁 Giải đã kết thúc (${T.total} ván)` : `⏹ Giải đã dừng ở ván ${T.index}/${T.total}`;
+  const t = $('tourTable');
+  t.innerHTML = '';
+  const head = document.createElement('tr');
+  ['#', 'Model', 'Điểm', 'Ván', 'T-H-B'].forEach(x => head.appendChild(cellOf('th', x)));
+  t.appendChild(head);
+  T.standings.forEach((r, i) => {
+    const tr = document.createElement('tr');
+    tr.appendChild(cellOf('td', i + 1));
+    tr.appendChild(cellOf('td', r.name));
+    tr.appendChild(cellOf('td', r.points, 'elo'));
+    tr.appendChild(cellOf('td', r.games));
+    tr.appendChild(cellOf('td', `${r.w}-${r.d}-${r.l}`));
+    t.appendChild(tr);
+  });
+  const box = $('tourGames');
+  box.innerHTML = '';
+  T.games.forEach((g, i) => {
+    const row = document.createElement('div');
+    row.className = 'hrow';
+    const res = g.result === '' ? 'đang chơi...' : g.result === 'void' ? `hủy (${g.reason})`
+      : g.result === 'stopped' ? 'đã dừng' : (RESULT_TEXT[g.result] || g.result);
+    row.textContent = `${i + 1}. ${g.white} (Trắng) vs ${g.black} (Đen): ${res}`;
+    box.appendChild(row);
+  });
+}
+
+$('gpp').onchange = updateTourInfo;
+$('maxplies').oninput = updateTourInfo;
+$('startTour').onclick = () => {
+  const models = [...tourSel];
+  if (models.length < 2) { $('err').textContent = 'Hãy chọn ít nhất 2 người chơi cho giải đấu.'; return; }
+  call('/api/tournament/start', { models, games_per_pair: parseInt($('gpp').value) || 2,
+    delay: parseFloat($('delay').value) || 0, max_plies: parseInt($('maxplies').value) || 200 });
+};
+
 $('cont').onclick = () => call('/api/continue');
 $('pause').onclick = () => call('/api/pause');
 try { $('manual').checked = localStorage.getItem('manual') !== '0'; } catch (_) {}

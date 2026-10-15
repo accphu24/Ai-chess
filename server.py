@@ -14,6 +14,7 @@ import datetime
 import hmac
 import json
 import os
+import random
 import threading
 import time
 import uuid
@@ -228,11 +229,12 @@ class Game:
     """phase: idle (giữa 2 nước) | thinking (AI đang nghĩ) | ready (AI đã nghĩ xong, chờ bấm Tiếp tục)
     | error (AI gặp lỗi, chờ bấm Tiếp tục để thử lại)."""
 
-    def __init__(self, white, black, delay, max_plies, manual):
+    def __init__(self, white, black, delay, max_plies, manual, auto_retries=None):
         self.players = {chess.WHITE: white, chess.BLACK: black}
         self.delay = delay
         self.max_plies = max_plies
         self.manual = manual
+        self.auto_retries = auto_retries  # None = chờ người bấm Tiếp tục khi lỗi; số = tự thử lại rồi hủy ván
         self.board = chess.Board()
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -304,8 +306,17 @@ class Game:
             if release_when_auto and not self.manual:
                 return
 
+    def stop(self):
+        self.stop_event.set()
+        with self.lock:
+            if self.status == "running":
+                self.status = "stopped"
+                self.phase = "idle"
+
     def _think(self, player):
-        """Hỏi AI nước đi. Nếu lỗi thì chờ người dùng bấm Tiếp tục để thử lại."""
+        """Hỏi AI nước đi. Nếu lỗi thì chờ người dùng bấm Tiếp tục để thử lại
+        (hoặc, ở giải đấu, tự thử lại vài lần rồi hủy ván)."""
+        errors = 0
         while not self.stop_event.is_set():
             with self.lock:
                 self.phase = "thinking"
@@ -314,6 +325,16 @@ class Game:
             try:
                 return player.choose_move(board_copy)
             except Exception as e:  # lỗi mạng, hết quota, lỗi phía dịch vụ...
+                errors += 1
+                if self.auto_retries is not None:
+                    if errors > self.auto_retries:
+                        with self.lock:
+                            self.status = "error"
+                            self.message = f"{player.name}: {e}"
+                            self.phase = "idle"
+                        return None, None
+                    self._sleep(TOURNEY_RETRY_SLEEP * errors)
+                    continue
                 with self.lock:
                     self.go.clear()
                     self.phase = "error"
@@ -385,7 +406,12 @@ class Game:
 
 
 current = None
+tournament = None
 GLOCK = threading.Lock()
+
+MAX_TOURNEY_PLAYERS = 8
+MAX_TOURNEY_GAMES = 60
+TOURNEY_RETRY_SLEEP = 10.0  # giây; lần lỗi thứ k chờ k*10 giây rồi thử lại
 
 
 @app.on_event("startup")
@@ -403,6 +429,108 @@ class StartReq(BaseModel):
 
 class ModeReq(BaseModel):
     manual: bool
+
+
+class Tournament:
+    """Giải vòng tròn: mỗi cặp đấu games_per_pair ván, đổi màu xen kẽ, chạy tự động lần lượt từng ván."""
+
+    def __init__(self, specs, names, games_per_pair, delay, max_plies):
+        self.specs, self.names = specs, names
+        self.delay, self.max_plies = delay, max_plies
+        pairs = [(i, j) for i in range(len(specs)) for j in range(i + 1, len(specs))]
+        self.schedule = []
+        for g in range(games_per_pair):
+            for i, j in pairs:
+                self.schedule.append((specs[i], specs[j]) if g % 2 == 0 else (specs[j], specs[i]))
+        self.lock = threading.RLock()
+        self.stop_event = threading.Event()
+        self.status = "running"  # running | finished | stopped
+        self.index = 0
+        self.games = []
+        self.game = None
+        self.stats = {n: {"name": n, "points": 0.0, "games": 0, "w": 0, "d": 0, "l": 0} for n in names.values()}
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def active(self):
+        return self.status == "running"
+
+    def _set(self, entry, **kw):
+        with self.lock:
+            entry.update(kw)
+
+    def _score(self, white, black, result):
+        sw = 1.0 if result == "1-0" else 0.0 if result == "0-1" else 0.5  # "*" (hết giới hạn nước) = hòa
+        for name, s in ((white, sw), (black, 1.0 - sw)):
+            st = self.stats[name]
+            st["games"] += 1
+            st["points"] += s
+            st["w" if s == 1.0 else "l" if s == 0.0 else "d"] += 1
+
+    def stop(self):
+        self.stop_event.set()
+        g = self.game
+        if g is not None:
+            g.stop()
+
+    def snapshot(self):
+        with self.lock:
+            standings = sorted(self.stats.values(), key=lambda s: (-s["points"], -s["w"], s["name"]))
+            return {"status": self.status, "active": self.active(), "index": self.index,
+                    "total": len(self.schedule), "games": [dict(g) for g in self.games],
+                    "standings": [dict(s) for s in standings]}
+
+    def run(self):
+        global current
+        try:
+            for idx, (ws, bs) in enumerate(self.schedule):
+                if self.stop_event.is_set():
+                    break
+                entry = {"white": self.names[ws], "black": self.names[bs], "result": "", "reason": ""}
+                with self.lock:
+                    self.index = idx + 1
+                    self.games.append(entry)
+                try:
+                    white = make_player(ws)
+                except (Exception, SystemExit) as e:
+                    self._set(entry, result="void", reason=f"Không tạo được người chơi ({type(e).__name__})")
+                    continue
+                try:
+                    black = make_player(bs)
+                except (Exception, SystemExit) as e:
+                    white.close()
+                    self._set(entry, result="void", reason=f"Không tạo được người chơi ({type(e).__name__})")
+                    continue
+                game = Game(white, black, self.delay, self.max_plies, False, auto_retries=3)
+                with GLOCK:
+                    current = game
+                with self.lock:
+                    self.game = game
+                game.thread.start()
+                while game.thread.is_alive():
+                    game.thread.join(0.5)
+                    if self.stop_event.is_set():
+                        break
+                with self.lock:
+                    if game.status == "finished":
+                        entry.update(result=game.result, reason=game.message)
+                        self._score(entry["white"], entry["black"], game.result)
+                    elif self.stop_event.is_set():
+                        entry.update(result="stopped", reason="Đã dừng")
+                    else:  # lỗi API quá nhiều lần: hủy ván, không tính điểm
+                        entry.update(result="void", reason=(game.message or "Ván bị hủy")[:120])
+                if not self.stop_event.is_set():
+                    time.sleep(2)  # nghỉ giữa các ván cho dịu API
+        finally:
+            with self.lock:
+                self.status = "stopped" if self.stop_event.is_set() else "finished"
+                self.game = None
+
+
+class TournamentReq(BaseModel):
+    models: list[str] = []
+    games_per_pair: int = 2
+    delay: float = 0.5
+    max_plies: int = 200
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -474,20 +602,46 @@ def models(refresh: bool = False):
         if ids:
             groups.append({"label": PROVIDER_LABELS[provider],
                            "items": [{"spec": f"{provider}:{i}", "label": i} for i in ids]})
+    if any(g["items"] for g in groups[1:]):  # chỉ hiện khi có ít nhất 1 model AI để bốc
+        groups.insert(1, {"label": "Đặc biệt", "items": [
+            {"spec": "pick:random", "label": "🎲 Ngẫu nhiên một model"}]})
     data = {"groups": groups, "notes": notes}
     _models_cache.update(t=now, data=data)
     return data
+
+
+def _pool():
+    """Các model AI để bốc ngẫu nhiên (không gồm Random/Stockfish)."""
+    data = models(refresh=False)
+    return [it["spec"] for g in data["groups"] if g["label"] not in ("Cơ bản", "Đặc biệt") for it in g["items"]]
+
+
+def _resolve_specs(white, black):
+    """Thay 'pick:random' bằng một model thật; cố gắng không để hai bên trùng nhau."""
+    white, black = white.strip(), black.strip()
+    if "pick:random" not in (white, black):
+        return white, black
+    pool = _pool()
+    if not pool:
+        raise HTTPException(400, "Chưa có model AI nào để bốc ngẫu nhiên (cần đặt API key của ít nhất một dịch vụ).")
+    if white == "pick:random":
+        white = random.choice([s for s in pool if s != black] or pool)
+    if black == "pick:random":
+        black = random.choice([s for s in pool if s != white] or pool)
+    return white, black
 
 
 # ---- điều khiển ván cờ ----
 @app.get("/api/state", dependencies=[Depends(auth)])
 def state():
     if current is None:
-        return {"results_count": len(RESULTS), "status": "idle", "paused": False, "manual": True, "phase": "idle", "error": "",
+        return {"tournament": tournament.snapshot() if tournament else None,
+                "results_count": len(RESULTS), "status": "idle", "paused": False, "manual": True, "phase": "idle", "error": "",
                 "can_continue": False, "turn": "white", "message": "", "result": "*",
                 "fen": chess.STARTING_FEN, "last": None, "white": "", "black": "", "log": []}
     data = current.snapshot()
     data["results_count"] = len(RESULTS)
+    data["tournament"] = tournament.snapshot() if tournament else None
     return data
 
 
@@ -495,14 +649,15 @@ def state():
 def start(req: StartReq):
     global current
     with GLOCK:
-        if current and current.active():
-            raise HTTPException(409, "Đang có ván chạy. Hãy dừng ván hiện tại trước.")
+        if (current and current.active()) or (tournament and tournament.active()):
+            raise HTTPException(409, "Đang có ván hoặc giải đấu chạy. Hãy dừng trước.")
+        white_spec, black_spec = _resolve_specs(req.white, req.black)
         try:
-            white = make_player(req.white.strip())
+            white = make_player(white_spec)
         except (Exception, SystemExit) as e:
             raise HTTPException(400, f"Không tạo được người chơi Trắng: {e}")
         try:
-            black = make_player(req.black.strip())
+            black = make_player(black_spec)
         except (Exception, SystemExit) as e:
             white.close()
             raise HTTPException(400, f"Không tạo được người chơi Đen: {e}")
@@ -552,12 +707,12 @@ def mode(req: ModeReq):
 
 @app.post("/api/stop", dependencies=[Depends(auth)])
 def stop():
+    if tournament is not None and tournament.active():
+        tournament.stop()
+        return {"ok": True}
     if current is None or not current.active():
         raise HTTPException(409, "Không có ván nào đang chạy.")
-    current.stop_event.set()
-    with current.lock:
-        current.status = "stopped"
-        current.phase = "idle"
+    current.stop()
     return {"ok": True}
 
 
@@ -597,3 +752,37 @@ def import_results(req: ResultsIn):
 def clear_results():
     clear_all_results()
     return {"ok": True}
+
+
+# ---- giải đấu ----
+@app.post("/api/tournament/start", dependencies=[Depends(auth)])
+def tournament_start(req: TournamentReq):
+    global tournament
+    specs = list(dict.fromkeys(s.strip() for s in req.models if s.strip()))
+    if any(s.startswith("pick:") for s in specs):
+        raise HTTPException(400, "Giải đấu cần chọn model cụ thể, không dùng 'Ngẫu nhiên'.")
+    if len(specs) < 2:
+        raise HTTPException(400, "Cần chọn ít nhất 2 người chơi.")
+    if len(specs) > MAX_TOURNEY_PLAYERS:
+        raise HTTPException(400, f"Tối đa {MAX_TOURNEY_PLAYERS} người chơi mỗi giải.")
+    gpp = max(1, min(4, req.games_per_pair))
+    total = len(specs) * (len(specs) - 1) // 2 * gpp
+    if total > MAX_TOURNEY_GAMES:
+        raise HTTPException(400, f"Giải có {total} ván, vượt giới hạn {MAX_TOURNEY_GAMES}. Hãy bớt model hoặc giảm số ván mỗi cặp.")
+    with GLOCK:
+        if (current and current.active()) or (tournament and tournament.active()):
+            raise HTTPException(409, "Đang có ván hoặc giải đấu chạy. Hãy dừng trước.")
+        names = {}
+        for s in specs:  # tạo thử để báo lỗi sớm (thiếu key, sai tên...) và lấy tên hiển thị
+            try:
+                pl = make_player(s)
+            except (Exception, SystemExit) as e:
+                raise HTTPException(400, f"Không tạo được '{s}': {e}")
+            names[s] = pl.name
+            pl.close()
+        if len(set(names.values())) < len(specs):
+            raise HTTPException(400, "Có hai lựa chọn trùng tên hiển thị.")
+        tournament = Tournament(specs, names, gpp, max(0.0, min(30.0, req.delay)),
+                                max(10, min(400, req.max_plies)))
+        tournament.thread.start()
+    return {"ok": True, "total": total}
