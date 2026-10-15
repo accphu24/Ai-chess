@@ -16,3 +16,7 @@ services:
         sync: false
       - key: ANTHROPIC_API_KEY
         sync: false
+      - key: MONGODB_URI      # chuỗi kết nối MongoDB Atlas (mongodb+srv://...)
+        sync: false
+      - key: MONGODB_DB       # tên database, bỏ trống thì dùng "ai_projects"
+        sync: false

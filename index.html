@@ -57,7 +57,7 @@
 <body>
 <div class="wrap">
   <div class="left card">
-    <h1>Chess AI Arena <small>v6</small></h1>
+    <h1>Chess AI Arena <small>v7</small></h1>
     <div id="bw"><div id="board"></div></div>
     <div id="status">Đang tải...</div>
     <div class="players" id="players"></div>
@@ -90,6 +90,7 @@
       <h2>Bảng xếp hạng</h2>
       <div class="tbl"><table id="lb"></table></div>
       <div class="hint" id="lbnote"></div>
+      <div class="hint" id="store"></div>
       <details><summary>Lịch sử ván đấu gần đây</summary><div id="hist"></div></details>
       <div class="btns"><button id="clearlb">Xóa bảng xếp hạng</button></div>
     </div>
@@ -305,6 +306,10 @@ async function loadLeaderboard() {
     $('lbnote').textContent = d.leaderboard.length
       ? 'Elo khởi đầu 1000, K=32. Cần nhiều ván mới đáng tin; nên cho model đấu với Random/Stockfish làm mốc. Ván hai bên cùng model, ván bị dừng giữa chừng không được tính; ván hết giới hạn nước tính là hòa.'
       : 'Chưa có ván nào được tính. Hãy cho hai model khác nhau đấu một ván hoàn chỉnh (ván cùng model hai bên không được tính).';
+    const sg = d.storage || {};
+    $('store').textContent = sg.backend === 'mongodb' ? '💾 Đang lưu vào MongoDB.'
+      : sg.configured ? `⚠ Không kết nối được MongoDB (${sg.error || 'lỗi'}). Đang lưu tạm vào file, sẽ mất khi deploy lại.`
+      : 'Chưa cấu hình MongoDB: dữ liệu lưu tạm vào file trên server và trình duyệt của bạn.';
     const h = $('hist');
     h.innerHTML = '';
     for (const r of d.recent) {

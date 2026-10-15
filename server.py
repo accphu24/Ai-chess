@@ -43,7 +43,7 @@ def auth(x_token: str = Header(default="")):
 # ---------------------------------------------------------------------------
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(BASE_DIR, "data"))
 RESULTS_FILE = os.path.join(DATA_DIR, "results.json")
-RESULTS_LOCK = threading.Lock()
+RESULTS_LOCK = threading.RLock()
 VALID_RESULTS = {"1-0", "0-1", "1/2-1/2", "*"}
 MAX_RESULTS = 5000
 ELO_START, ELO_K = 1000.0, 32.0
@@ -85,15 +85,85 @@ def _save_results():  # gọi khi đang giữ RESULTS_LOCK
 
 RESULTS = _load_results()
 
+# --- MongoDB (tùy chọn): đặt MONGODB_URI để bật. Không có/không kết nối được thì dùng file. ---
+# Biến môi trường: MONGODB_URI (bắt buộc để bật), MONGODB_DB (mặc định ai_projects),
+# MONGODB_COLLECTION (mặc định chess_arena_results - collection riêng nên không đụng dự án khác)
+_mongo_state = {"coll": None, "fail_t": 0.0, "error": ""}
+
+
+def _mongo_fail(e):
+    _mongo_state.update(coll=None, fail_t=time.time(), error=type(e).__name__)  # không ghi chi tiết lỗi để khỏi lộ thông tin
+
+
+def _sync_union(coll):
+    """Hợp nhất 2 chiều: kết quả trong MongoDB <-> kết quả đang có trong bộ nhớ."""
+    from pymongo import UpdateOne
+
+    docs = [r for r in (_clean_result(d) for d in coll.find({}, {"_id": 0})) if r]
+    mongo_ids = {d["id"] for d in docs}
+    with RESULTS_LOCK:
+        local_ids = {r["id"] for r in RESULTS}
+        for d in docs:
+            if d["id"] not in local_ids and len(RESULTS) < MAX_RESULTS:
+                RESULTS.append(d)
+        missing = [r for r in RESULTS if r["id"] not in mongo_ids]
+        _save_results()
+    if missing:
+        coll.bulk_write([UpdateOne({"id": r["id"]}, {"$set": r}, upsert=True) for r in missing], ordered=False)
+
+
+def _mongo():
+    uri = os.environ.get("MONGODB_URI", "").strip()
+    st = _mongo_state
+    if not uri:
+        return None
+    if st["coll"] is not None:
+        return st["coll"]
+    if time.time() - st["fail_t"] < 60:  # vừa lỗi: đừng thử lại liên tục
+        return None
+    try:
+        import pymongo
+
+        client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=5000)
+        coll = client[os.environ.get("MONGODB_DB", "ai_projects")][
+            os.environ.get("MONGODB_COLLECTION", "chess_arena_results")]
+        coll.create_index("id", unique=True)  # cũng là bước kiểm tra kết nối
+        _sync_union(coll)
+        st.update(coll=coll, error="")
+        return coll
+    except Exception as e:
+        _mongo_fail(e)
+        return None
+
+
+def storage_info():
+    coll = _mongo()
+    configured = bool(os.environ.get("MONGODB_URI", "").strip())
+    return {"backend": "mongodb" if coll is not None else "file", "configured": configured,
+            "error": _mongo_state["error"] if configured and coll is None else ""}
+
+
+def _persist_upsert(recs):
+    coll = _mongo()
+    if coll is None or not recs:
+        return
+    try:
+        from pymongo import UpdateOne
+
+        coll.bulk_write([UpdateOne({"id": r["id"]}, {"$set": r}, upsert=True) for r in recs], ordered=False)
+    except Exception as e:
+        _mongo_fail(e)
+
 
 def add_result(rec):
     with RESULTS_LOCK:
         RESULTS.append(rec)
         _save_results()
+    _persist_upsert([rec])
 
 
 def merge_results(items):
-    added = 0
+    new = []
     with RESULTS_LOCK:
         ids = {r["id"] for r in RESULTS}
         for item in items:
@@ -101,10 +171,23 @@ def merge_results(items):
             if r and r["id"] not in ids and len(RESULTS) < MAX_RESULTS:
                 RESULTS.append(r)
                 ids.add(r["id"])
-                added += 1
-        if added:
+                new.append(r)
+        if new:
             _save_results()
-    return added
+    _persist_upsert(new)
+    return len(new)
+
+
+def clear_all_results():
+    with RESULTS_LOCK:
+        RESULTS.clear()
+        _save_results()
+    coll = _mongo()
+    if coll is not None:
+        try:
+            coll.delete_many({})
+        except Exception as e:
+            _mongo_fail(e)
 
 
 def compute_leaderboard(results):
@@ -252,7 +335,9 @@ class Game:
                         else:
                             self.result = "*"
                             self.message = "ĐẠT GIỚI HẠN SỐ NƯỚC"
-                        add_result(self._record())
+                        rec = self._record()
+                    add_result(rec)  # ngoài khóa: lưu MongoDB có thể mất vài giây
+                    with self.lock:
                         self.status = "finished"
                         self.phase = "idle"
                     return
@@ -301,6 +386,11 @@ class Game:
 
 current = None
 GLOCK = threading.Lock()
+
+
+@app.on_event("startup")
+def _connect_storage():
+    threading.Thread(target=_mongo, daemon=True).start()
 
 
 class StartReq(BaseModel):
@@ -488,7 +578,8 @@ def leaderboard():
     with RESULTS_LOCK:
         snapshot = list(RESULTS)
     recent = sorted(snapshot, key=lambda r: r["ts"], reverse=True)[:15]
-    return {"leaderboard": compute_leaderboard(snapshot), "recent": recent, "total": len(snapshot)}
+    return {"leaderboard": compute_leaderboard(snapshot), "recent": recent, "total": len(snapshot),
+            "storage": storage_info()}
 
 
 @app.get("/api/results", dependencies=[Depends(auth)])
@@ -504,7 +595,5 @@ def import_results(req: ResultsIn):
 
 @app.delete("/api/results", dependencies=[Depends(auth)])
 def clear_results():
-    with RESULTS_LOCK:
-        RESULTS.clear()
-        _save_results()
+    clear_all_results()
     return {"ok": True}
