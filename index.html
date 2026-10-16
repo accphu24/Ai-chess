@@ -31,7 +31,7 @@
   #status.warn { color:#d69e2e; }
   input[type=checkbox] { width:auto; margin-right:6px; vertical-align:middle; }
   .chk { display:block; margin-top:10px; font-size:14px; color:var(--fg); }
-  .players { color:var(--muted); font-size:13px; }
+  .players { color:var(--muted); font-size:13px; white-space:pre-line; }
   label { display:block; font-size:13px; color:var(--muted); margin-bottom:2px; }
   input, select { width:100%; padding:7px 8px; border:1px solid var(--bd); border-radius:6px; background:var(--bg); color:var(--fg); font:inherit; }
   .row { display:flex; gap:8px; } .row > div { flex:1; min-width:0; }
@@ -66,7 +66,7 @@
 <body>
 <div class="wrap">
   <div class="left card">
-    <h1>Chess AI Arena <small>v8</small></h1>
+    <h1>Chess AI Arena <small>v9</small></h1>
     <div id="bw"><div id="board"></div></div>
     <div id="status">Đang tải...</div>
     <div class="players" id="players"></div>
@@ -102,6 +102,7 @@
         <div><label>Giới hạn nửa-nước</label><input id="maxplies" type="number" min="10" max="400" value="200"></div>
       </div>
       <label class="chk" id="manualWrap"><input type="checkbox" id="manual" checked>Chế độ từng nước: AI nghĩ xong thì chờ tôi bấm "Tiếp tục" mới đi</label>
+      <label class="chk"><input type="checkbox" id="brief" checked>Tiết kiệm token: AI chỉ trả nước đi, không giải thích (nên bật để đỡ hết hạn mức)</label>
       <div class="btns">
         <div class="g" id="singleBtns">
           <button class="primary" id="start">Bắt đầu ván mới</button>
@@ -238,7 +239,11 @@ async function refresh() {
     if (s.results_count !== undefined) onResultsChanged(s.results_count);
     $('status').textContent = statusText(s);
     $('status').className = s.status !== 'running' ? '' : (s.phase === 'ready' ? 'ready' : (s.phase === 'error' ? 'warn' : ''));
+    const tk = s.tokens;
+    const used = tk ? tk.white[0] + tk.white[1] + tk.black[0] + tk.black[1] : 0;
+    const fmt = n => n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
     $('players').textContent = s.white ? `Trắng: ${s.white}  ·  Đen: ${s.black}` : '';
+    if (s.white && used > 0) $('players').textContent += `\nToken (vào/ra): Trắng ${fmt(tk.white[0])}/${fmt(tk.white[1])} · Đen ${fmt(tk.black[0])}/${fmt(tk.black[1])}`;
     const T = s.tournament;
     const tourActive = !!(T && T.active);
     renderTournament(T);
@@ -304,7 +309,7 @@ async function loadModels(force) {
 $('start').onclick = () => call('/api/start', {
   white: $('whiteSel').value, black: $('blackSel').value,
   delay: parseFloat($('delay').value) || 0, max_plies: parseInt($('maxplies').value) || 200,
-  manual: $('manual').checked,
+  manual: $('manual').checked, brief: $('brief').checked,
 });
 
 /* ---- chế độ ván đơn / giải đấu ---- */
@@ -414,12 +419,14 @@ $('startTour').onclick = () => {
   const models = [...tourSel];
   if (models.length < 2) { $('err').textContent = 'Hãy chọn ít nhất 2 người chơi cho giải đấu.'; return; }
   call('/api/tournament/start', { models, games_per_pair: parseInt($('gpp').value) || 2,
-    delay: parseFloat($('delay').value) || 0, max_plies: parseInt($('maxplies').value) || 200 });
+    delay: parseFloat($('delay').value) || 0, max_plies: parseInt($('maxplies').value) || 200, brief: $('brief').checked });
 };
 
 $('cont').onclick = () => call('/api/continue');
 $('pause').onclick = () => call('/api/pause');
 try { $('manual').checked = localStorage.getItem('manual') !== '0'; } catch (_) {}
+try { $('brief').checked = localStorage.getItem('brief') !== '0'; } catch (_) {}
+$('brief').onchange = () => { try { localStorage.setItem('brief', $('brief').checked ? '1' : '0'); } catch (_) {} };
 $('manual').onchange = () => {
   try { localStorage.setItem('manual', $('manual').checked ? '1' : '0'); } catch (_) {}
   call('/api/mode', { manual: $('manual').checked });

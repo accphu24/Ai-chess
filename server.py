@@ -25,7 +25,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from players import PRESETS, make_player
+from players import PRESETS, QuotaExhausted, make_player
 
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -234,6 +234,7 @@ class Game:
         self.delay = delay
         self.max_plies = max_plies
         self.manual = manual
+        self.fatal_player = None  # tên người chơi bị hết hạn mức (dùng cho giải đấu)
         self.auto_retries = auto_retries  # None = chờ người bấm Tiếp tục khi lỗi; số = tự thử lại rồi hủy ván
         self.board = chess.Board()
         self.lock = threading.Lock()
@@ -273,6 +274,8 @@ class Game:
                 "white": self.players[chess.WHITE].name,
                 "black": self.players[chess.BLACK].name,
                 "log": list(self.log),
+                "tokens": {"white": list(self.players[chess.WHITE].usage()),
+                           "black": list(self.players[chess.BLACK].usage())},
             }
 
     def pgn(self):
@@ -326,12 +329,15 @@ class Game:
                 return player.choose_move(board_copy)
             except Exception as e:  # lỗi mạng, hết quota, lỗi phía dịch vụ...
                 errors += 1
+                fatal = isinstance(e, QuotaExhausted)
                 if self.auto_retries is not None:
-                    if errors > self.auto_retries:
+                    if fatal or errors > self.auto_retries:
                         with self.lock:
                             self.status = "error"
                             self.message = f"{player.name}: {e}"
                             self.phase = "idle"
+                            if fatal:
+                                self.fatal_player = player.name
                         return None, None
                     self._sleep(TOURNEY_RETRY_SLEEP * errors)
                     continue
@@ -425,6 +431,7 @@ class StartReq(BaseModel):
     delay: float = 1.0
     max_plies: int = 200
     manual: bool = True
+    brief: bool = True  # tiết kiệm token: AI chỉ trả nước đi
 
 
 class ModeReq(BaseModel):
@@ -434,8 +441,10 @@ class ModeReq(BaseModel):
 class Tournament:
     """Giải vòng tròn: mỗi cặp đấu games_per_pair ván, đổi màu xen kẽ, chạy tự động lần lượt từng ván."""
 
-    def __init__(self, specs, names, games_per_pair, delay, max_plies):
+    def __init__(self, specs, names, games_per_pair, delay, max_plies, brief=True):
         self.specs, self.names = specs, names
+        self.brief = brief
+        self.dead = set()  # người chơi đã hết hạn mức: bỏ qua các ván còn lại của họ
         self.delay, self.max_plies = delay, max_plies
         pairs = [(i, j) for i in range(len(specs)) for j in range(i + 1, len(specs))]
         self.schedule = []
@@ -489,13 +498,17 @@ class Tournament:
                 with self.lock:
                     self.index = idx + 1
                     self.games.append(entry)
+                dead = [n for n in (entry["white"], entry["black"]) if n in self.dead]
+                if dead:
+                    self._set(entry, result="void", reason=f"bỏ qua: {dead[0]} đã hết hạn mức")
+                    continue
                 try:
-                    white = make_player(ws)
+                    white = make_player(ws, brief=self.brief)
                 except (Exception, SystemExit) as e:
                     self._set(entry, result="void", reason=f"Không tạo được người chơi ({type(e).__name__})")
                     continue
                 try:
-                    black = make_player(bs)
+                    black = make_player(bs, brief=self.brief)
                 except (Exception, SystemExit) as e:
                     white.close()
                     self._set(entry, result="void", reason=f"Không tạo được người chơi ({type(e).__name__})")
@@ -518,6 +531,8 @@ class Tournament:
                         entry.update(result="stopped", reason="Đã dừng")
                     else:  # lỗi API quá nhiều lần: hủy ván, không tính điểm
                         entry.update(result="void", reason=(game.message or "Ván bị hủy")[:120])
+                        if game.fatal_player:
+                            self.dead.add(game.fatal_player)
                 if not self.stop_event.is_set():
                     time.sleep(2)  # nghỉ giữa các ván cho dịu API
         finally:
@@ -531,6 +546,7 @@ class TournamentReq(BaseModel):
     games_per_pair: int = 2
     delay: float = 0.5
     max_plies: int = 200
+    brief: bool = True
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -653,11 +669,11 @@ def start(req: StartReq):
             raise HTTPException(409, "Đang có ván hoặc giải đấu chạy. Hãy dừng trước.")
         white_spec, black_spec = _resolve_specs(req.white, req.black)
         try:
-            white = make_player(white_spec)
+            white = make_player(white_spec, brief=req.brief)
         except (Exception, SystemExit) as e:
             raise HTTPException(400, f"Không tạo được người chơi Trắng: {e}")
         try:
-            black = make_player(black_spec)
+            black = make_player(black_spec, brief=req.brief)
         except (Exception, SystemExit) as e:
             white.close()
             raise HTTPException(400, f"Không tạo được người chơi Đen: {e}")
@@ -775,7 +791,7 @@ def tournament_start(req: TournamentReq):
         names = {}
         for s in specs:  # tạo thử để báo lỗi sớm (thiếu key, sai tên...) và lấy tên hiển thị
             try:
-                pl = make_player(s)
+                pl = make_player(s, brief=req.brief)
             except (Exception, SystemExit) as e:
                 raise HTTPException(400, f"Không tạo được '{s}': {e}")
             names[s] = pl.name
@@ -783,6 +799,6 @@ def tournament_start(req: TournamentReq):
         if len(set(names.values())) < len(specs):
             raise HTTPException(400, "Có hai lựa chọn trùng tên hiển thị.")
         tournament = Tournament(specs, names, gpp, max(0.0, min(30.0, req.delay)),
-                                max(10, min(400, req.max_plies)))
+                                max(10, min(400, req.max_plies)), brief=req.brief)
         tournament.thread.start()
     return {"ok": True, "total": total}
